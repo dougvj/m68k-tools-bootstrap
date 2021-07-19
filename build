@@ -1,0 +1,227 @@
+#!/bin/bash
+set -u
+set -x
+
+BASE_DIR=$(dirname $(realpath $0))
+
+source $BASE_DIR/config.env
+
+DEPS_FOUND=1
+
+check_dependency() {
+  if [ -z `which $1` ]
+  then
+    echo "'$1' not found in path."
+    DEPS_FOUND=0
+  fi
+}
+
+check_dependency git
+check_dependency gcc
+
+echo "Building in '$BUILD_DIR'"
+echo "Installing to '$INSTALL_PREFIX'"
+
+
+if [ $DEPS_FOUND -eq 0 ]
+then
+  echo "Please install required dependencies, or use one of the many ./deps scripts"
+  exit 1
+fi
+
+set -e
+
+install_linux_headers() {
+  TARGET=$1
+  if [ ! -d ./linux ]
+  then
+    git clone "$LINUX_GIT_URL" ./linux
+  fi
+  pushd ./linux
+  export ARCH=m68k
+  export CROSS_COMPILE=m68k-linux-
+  git checkout $LINUX_GIT_REF
+  if [ "$LINUX_APPLY_M68K_VM_PATCH" -eq 1 ]
+  then
+    wget -O m68k-vm.patch "https://marc.info/?l=linux-m68k&m=161653776430959&q=mbox"
+    git reset --hard $LINUX_GIT_REF
+    git am m68k-vm.patch
+  fi
+  export ARCH=m68k
+  export CROSS_COMPILE=m68k-linux-
+  make INSTALL_HDR_PATH="$INSTALL_PREFIX/$TARGET" headers_install
+  popd
+}
+
+build_linux() {
+
+  pushd ./linux
+  export ARCH=m68k
+  export CROSS_COMPILE=m68k-linux-
+  make virt_defconfig
+  make -j$CONCURRENT_JOBS
+  popd
+}
+
+build_gcc() {
+  TARGET=$1
+  if [ ! -d ./binutils ]
+  then
+    git clone "$BINUTILS_GIT_URL" ./binutils
+    pushd ./binutils
+    git checkout "$BINUTILS_GIT_REF"
+    popd
+  fi
+  mkdir -p build-binutils-$TARGET
+  pushd build-binutils-$TARGET
+  ../binutils/configure \
+    --prefix="$INSTALL_PREFIX" \
+    --target=$TARGET
+  make -j$CONCURRENT_JOBS
+  make install
+  popd
+
+  if [ ! -d ./gcc ]
+  then
+    git clone $GCC_GIT_URL ./gcc
+    pushd ./gcc
+    git checkout $GCC_GIT_REF
+    popd
+  fi
+  mkdir -p build-gcc-$TARGET
+  pushd build-gcc-$TARGET
+  ../gcc/configure \
+    --prefix="$INSTALL_PREFIX" \
+    --target=$TARGET \
+    --enable-languages=c,c++
+  make -j$CONCURRENT_JOBS all-gcc
+  make install-gcc
+  popd
+}
+
+build_glibc() {
+  TARGET=$1
+
+  if [ ! -d ./glibc ]
+  then
+    git clone $GLIBC_GIT_URL ./glibc
+    pushd ./glibc
+    git checkout $GLIBC_GIT_REF
+    popd
+  fi
+  mkdir -p build-glibc
+  pushd build-glibc
+  ../glibc/configure \
+    --prefix=$INSTALL_PREFIX/$TARGET \
+    --build=$MACHTYPE --host=$TARGET \
+    --target=$TARGET \
+    --with-headers="$INSTALL_PREFIX/$TARGET/include"
+  make install-bootstrap-headers=yes install-headers
+  make -j$CONCURRENT_JOBS csu/subdir_lib
+  install csu/crt1.o csu/crti.o csu/crtn.o $INSTALL_PREFIX/$TARGET/lib
+  $TARGET-gcc -n -nostdlib -nostartfiles -shared -x c /dev/null -o $INSTALL_PREFIX/$TARGET/lib/libc.so
+  touch $INSTALL_PREFIX/$TARGET/include/gnu/stubs.h
+  popd
+
+  pushd build-gcc-$TARGET
+  make -j$CONCURRENT_JOBS all-target-libgcc
+  make install-target-libgcc
+  popd
+
+  pushd build-glibc
+  make -j$CONCURRENT_JOBS
+  make install
+  popd
+}
+
+build_clang() {
+  if [ ! -d ./llvm_project ]
+  then
+    git clone $LLVM_GIT_URL ./llvm_project
+  fi
+
+  pushd ./llvm_project
+  git checkout $LLVM_GIT_REF
+  popd
+
+  CLANG_INSTALL_PREFIX="$INSTALL_PREFIX/m68k-clang"
+  mkdir -p $CLANG_INSTALL_PREFIX
+
+  mkdir -p ./build-clang-m68k
+  pushd ./build-clang-m68k
+  cmake -G Ninja ../llvm_project/llvm \
+    -DLLVM_ENABLE_PROJECTS="lld;clang" \
+    -DLLVM_ENABLE_LIBXML2=OFF \
+    -DCMAKE_INSTALL_PREFIX="$CLANG_INSTALL_PREFIX" \
+    -DCMAKE_PREFIX_PATH="$CLANG_INSTALL_PREFIX" \
+    -DLLVM_INCLUDE_TESTS=OFF \
+    -DLLVM_INCLUDE_GO_TESTS=OFF \
+    -DLLVM_INCLUDE_EXAMPLES=OFF \
+    -DLLVM_INCLUDE_BENCHMARKS=OFF \
+    -DLLVM_ENABLE_BINDINGS=OFF \
+    -DLLVM_ENABLE_OCAMLDOC=OFF \
+    -DLLVM_ENABLE_Z3_SOLVER=OFF \
+    -DLLVM_TARGETS_TO_BUILD="M68k" \
+    -DLLVM_PARALLEL_LINK_JOBS=1 \
+    -DLLVM_DEFAULT_TARGET_TRIPLE=m68k-unknown-linux-gnu \
+    -DLLVM_EXPERIMENTAL_TARGETS_TO_BUILD=M68k \
+    -DCMAKE_BUILD_TYPE=Release
+  ninja
+  ninja install
+  popd
+  popd
+
+  for binary in "$CLANG_INSTALL_PREFIX/bin/"*
+  do
+    ln -s "$binary" "$INSTALL_PREFIX/bin/m68k-$(basename $binary)"
+  done
+}
+
+build_qemu() {
+  if [ ! -d ./qemu ]
+  then
+    git clone $QEMU_GIT_URL ./qemu
+  fi
+  pushd qemu
+  git checkout $QEMU_GIT_REF
+  ./configure --target-list=m68k-softmmu --prefix="$INSTALL_PREFIX"
+  make -j$CONCURRENT_JOBS
+  make install
+  popd
+}
+
+build_busybox() {
+  if [ ! -d ./busybox ]
+  then
+    git clone "$BUSYBOX_GIT_URL" ./busybox
+  fi
+  pushd busybox
+  git checkout "$BUSYBOX_GIT_REF"
+  make defconfig
+  make -j$CONCURRENT_JOBS
+  make install
+  popd
+}
+
+mkdir -p "$BUILD_DIR"
+mkdir -p "$INSTALL_PREFIX"
+export PATH=$INSTALL_PREFIX:$PATH
+pushd "$BUILD_DIR"
+
+install_linux_headers m68k-linux
+
+build_gcc m68k-elf
+
+build_gcc m68k-linux
+
+build_glibc m68k-linux
+
+build_clang
+
+build_qemu
+
+build_busybox
+
+build_linux
+
+popd
